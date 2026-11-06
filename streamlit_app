@@ -1,1 +1,303 @@
 
+python-3.10.12
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first (better layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy app + model (everything else excluded by .dockerignore)
+COPY app.py .
+COPY crop_recommendation_model.pkl .
+
+EXPOSE 8501
+
+HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]
+
+
+# ============================================================
+# .dockerignore — Intelligent Crop Recommendation System
+# ============================================================
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
+*.egg-info/
+venv/
+env/
+.venv/
+.ipynb_checkpoints/
+*.ipynb
+*.csv
+*.xlsx
+*.xls
+data/
+datasets/
+artifacts/*.log
+artifacts/*.tmp
+.env
+.env.*
+*.pem
+*.key
+.streamlit/
+.streamlit/secrets.toml
+.pytest_cache/
+.mypy_cache/
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+.DS_Store
+README.md
+*.md
+LICENSE
+Dockerfile
+.dockerignore
+docker-compose*.yml
+cloudflared
+cloudflared-linux-amd64
+optuna.db
+*.sqlite3
+mlruns/
+wandb/
+
+
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps first (better layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy app + model (everything else excluded by .dockerignore)
+COPY app.py .
+COPY crop_recommendation_model.pkl .
+
+EXPOSE 8501
+
+HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]
+
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
+from math import isfinite
+import joblib, pandas as pd, numpy as np
+
+app = FastAPI(
+    title="Crop Recommendation API",
+    version="1.0.0",
+    description="Predicts optimal crop from soil + climate features. "
+                "Model: Random Forest (99.3% ± 0.3% test accuracy). "
+                "Advisory only — not a substitute for soil testing.",
+)
+
+# Load once at startup
+_art = joblib.load("crop_recommendation_model.pkl")
+_MODEL    = _art["model"]
+_LE       = _art["label_encoder"]
+_FEATURES = _art["features"]
+
+class SoilInput(BaseModel):
+    N:           float = Field(..., ge=0, le=200, description="Nitrogen (mg/kg)")
+    P:           float = Field(..., ge=0, le=200, description="Phosphorus (mg/kg)")
+    K:           float = Field(..., ge=0, le=250, description="Potassium (mg/kg)")
+    temperature: float = Field(..., ge=-10, le=60, description="Temperature (°C)")
+    humidity:    float = Field(..., ge=0, le=100, description="Relative humidity (%)")
+    ph:          float = Field(..., ge=0, le=14, description="Soil pH")
+    rainfall:    float = Field(..., ge=0, le=400, description="Rainfall (mm)")
+
+    @validator("*")
+    def finite_only(cls, v):
+        if not isfinite(v):
+            raise ValueError("must be a finite number (not NaN/Inf)")
+        return v
+
+class Prediction(BaseModel):
+    crop: str
+    confidence: float
+    top_5: list[dict]
+    low_confidence: bool
+    advisory: str
+
+@app.get("/health")
+def health():
+    """Liveness + artifact integrity check."""
+    return {
+        "status": "ok",
+        "model": type(_MODEL).__name__,
+        "n_classes": _art["n_classes"],
+        "test_accuracy": _art["test_accuracy"],
+    }
+
+@app.post("/predict", response_model=Prediction)
+def predict(payload: SoilInput):
+    """Predict crop from 7 soil/climate features. Returns top-1 + top-5 alternatives."""
+    try:
+        row = pd.DataFrame([payload.dict()])[_FEATURES]
+        proba = _MODEL.predict_proba(row)[0]
+        idx = int(proba.argmax())
+        crop = _LE.inverse_transform([idx])[0]
+        conf = float(proba[idx])
+        top = proba.argsort()[::-1][:5]
+        return Prediction(
+            crop=crop,
+            confidence=conf,
+            top_5=[{"crop": _LE.inverse_transform([i])[0],
+                    "probability": float(proba[i])} for i in top],
+            low_confidence=conf < 0.60,
+            advisory=("Low confidence — verify with local soil test." if conf < 0.60
+         
+
+
+import streamlit as st
+import pandas as pd
+import joblib
+from math import isfinite
+
+st.set_page_config(page_title="Crop Recommendation", page_icon="🌱", layout="centered")
+
+@st.cache_resource
+def load_artifact():
+    return joblib.load("crop_recommendation_model.pkl")
+
+art      = load_artifact()
+model    = art["model"]
+le       = art["label_encoder"]
+FEATURES = art["features"]
+
+# Integrity check — fail visibly in the browser, not the terminal
+if not (len(art["classes"]) == art["n_classes"] == len(le.classes_)):
+    st.error(
+        f"⚠️ Artifact mismatch — n_classes={art['n_classes']}, "
+        f"classes={len(art['classes'])}, encoder={len(le.classes_)}. "
+        f"Re-run Cell 10."
+    )
+    st.stop()
+
+st.title("🌱 Intelligent Crop Recommendation System")
+st.caption(f"FUSE AI-201 | Group 11 | {type(model).__name__} "
+           f"({art['test_accuracy']:.2%} test accuracy)")
+
+with st.form("inputs"):
+    st.subheader("Soil measurements")
+    c1, c2 = st.columns(2)
+    with c1:
+        N  = st.number_input("Nitrogen (N) — mg/kg",   0.0, 200.0, 90.0, 1.0)
+        P  = st.number_input("Phosphorus (P) — mg/kg", 0.0, 200.0, 42.0, 1.0)
+        K  = st.number_input("Potassium (K) — mg/kg",  0.0, 250.0, 43.0, 1.0)
+        ph = st.slider("Soil pH",                      0.0, 14.0,   6.5, 0.1)
+    with c2:
+        temperature = st.number_input("Temperature (°C)", 0.0, 60.0, 20.8, 0.1)
+        humidity    = st.slider("Humidity (%)",           0.0, 100.0, 82.0, 0.1)
+        rainfall    = st.number_input("Rainfall (mm)",    0.0, 400.0, 202.9, 0.1)
+    submitted = st.form_submit_button("🌾 Recommend Crop", use_container_width=True)
+
+if submitted:
+    try:
+        # Inline validation (mirrors Cell 9 contract)
+        checks = {
+            "N":           (N,           0,  200),
+            "P":           (P,           0,  200),
+            "K":           (K,           0,  250),
+            "temperature": (temperature, -10, 60),
+            "humidity":    (humidity,    0,  100),
+            "ph":          (ph,          0,  14),
+            "rainfall":    (rainfall,    0,  400),
+        }
+        for name, (v, lo, hi) in checks.items():
+            if not isfinite(v) or not (lo <= v <= hi):
+                st.error(f"Invalid {name}={v} — must be in [{lo}, {hi}]")
+                st.stop()
+
+        row   = pd.DataFrame([{"N": N, "P": P, "K": K,
+                               "temperature": temperature, "humidity": humidity,
+                               "ph": ph, "rainfall": rainfall}])[FEATURES]
+        proba = model.predict_proba(row)[0]
+        idx   = int(proba.argmax())
+        crop  = le.inverse_transform([idx])[0]
+        conf  = float(proba[idx])
+
+        # Low-confidence advisory
+        if conf < 0.60:
+            st.warning(f"⚠️ Low confidence ({conf:.0%}). "
+                       f"Consider verifying with a local soil test before acting.")
+
+        st.success(f"### Recommended: **{crop.title()}**")
+        st.metric("Confidence", f"{conf:.1%}")
+        st.progress(min(conf, 1.0))
+
+        top = proba.argsort()[::-1][:5]
+        st.subheader("Top 5 alternatives")
+        st.dataframe(pd.DataFrame({"Crop": le.inverse_transform(top),
+                                   "Probability": proba[top]})
+                       .style.format({"Probability": "{:.2%}"}),
+                     use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Prediction failed: {type(e).__name__}: {e}")
+        st.stop()
+
+st.divider()
+st.warning("**Responsible AI Notice** — Advisory only. "
+           "Not a replacement for local soil tests or agronomist review.")
+             else "Advisory only — not a substitute for agronomist review."),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
