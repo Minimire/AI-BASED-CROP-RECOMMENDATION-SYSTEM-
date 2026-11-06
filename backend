@@ -1,0 +1,72 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
+from math import isfinite
+import joblib, pandas as pd, numpy as np
+
+app = FastAPI(
+    title="Crop Recommendation API",
+    version="1.0.0",
+    description="Predicts optimal crop from soil + climate features. "
+                "Model: Random Forest (99.3% ± 0.3% test accuracy). "
+                "Advisory only — not a substitute for soil testing.",
+)
+
+# Load once at startup
+_art = joblib.load("crop_recommendation_model.pkl")
+_MODEL    = _art["model"]
+_LE       = _art["label_encoder"]
+_FEATURES = _art["features"]
+
+class SoilInput(BaseModel):
+    N:           float = Field(..., ge=0, le=200, description="Nitrogen (mg/kg)")
+    P:           float = Field(..., ge=0, le=200, description="Phosphorus (mg/kg)")
+    K:           float = Field(..., ge=0, le=250, description="Potassium (mg/kg)")
+    temperature: float = Field(..., ge=-10, le=60, description="Temperature (°C)")
+    humidity:    float = Field(..., ge=0, le=100, description="Relative humidity (%)")
+    ph:          float = Field(..., ge=0, le=14, description="Soil pH")
+    rainfall:    float = Field(..., ge=0, le=400, description="Rainfall (mm)")
+
+    @validator("*")
+    def finite_only(cls, v):
+        if not isfinite(v):
+            raise ValueError("must be a finite number (not NaN/Inf)")
+        return v
+
+class Prediction(BaseModel):
+    crop: str
+    confidence: float
+    top_5: list[dict]
+    low_confidence: bool
+    advisory: str
+
+@app.get("/health")
+def health():
+    """Liveness + artifact integrity check."""
+    return {
+        "status": "ok",
+        "model": type(_MODEL).__name__,
+        "n_classes": _art["n_classes"],
+        "test_accuracy": _art["test_accuracy"],
+    }
+
+@app.post("/predict", response_model=Prediction)
+def predict(payload: SoilInput):
+    """Predict crop from 7 soil/climate features. Returns top-1 + top-5 alternatives."""
+    try:
+        row = pd.DataFrame([payload.dict()])[_FEATURES]
+        proba = _MODEL.predict_proba(row)[0]
+        idx = int(proba.argmax())
+        crop = _LE.inverse_transform([idx])[0]
+        conf = float(proba[idx])
+        top = proba.argsort()[::-1][:5]
+        return Prediction(
+            crop=crop,
+            confidence=conf,
+            top_5=[{"crop": _LE.inverse_transform([i])[0],
+                    "probability": float(proba[i])} for i in top],
+            low_confidence=conf < 0.60,
+            advisory=("Low confidence — verify with local soil test." if conf < 0.60
+                      else "Advisory only — not a substitute for agronomist review."),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
